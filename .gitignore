@@ -1,2 +1,7 @@
 /.env
 /node_modules
+/.vscode 
+/dist 
+/build 
+.DS_Store 
+*.log
