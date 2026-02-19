@@ -114,6 +114,10 @@ async function createTransaction(req, res) {
             type: "DEBIT"
         }], { session })
 
+        await (() => {
+            return new Promise((resolve) => setTimeout(resolve, 15 * 1000));
+        })()
+
         const creditLedgerEntry = await ledgerModel.create([{
             account: toAccount,
             amount: amount,
