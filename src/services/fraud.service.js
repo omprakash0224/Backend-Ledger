@@ -102,7 +102,7 @@ async function checkDailyLimit(fromAccountId, amount) {
   const result = await ledgerModel.aggregate([
     {
       $match: {
-        account: fromAccountId,
+        account: new mongoose.Types.ObjectId(fromAccountId),
         type: "DEBIT",
         // Ledger has no timestamps by default — use transaction createdAt via $lookup
         // Instead we filter by _id timestamp (ObjectId contains creation time)
