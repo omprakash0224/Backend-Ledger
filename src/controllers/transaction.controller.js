@@ -2,6 +2,7 @@ const transactionModel = require('../models/transaction.model');
 const ledgerModel = require('../models/ledger.model');
 const accountModel = require('../models/account.model');
 const emailService = require('../services/email.service');
+const fraudAlertModel = require('../models/fraudAlert.model');
 const mongoose = require('mongoose');
 
 /**
@@ -139,9 +140,21 @@ async function createTransaction(req, res) {
         })
     }
 
+    // Link fraud alerts to this transaction (post-commit, fire-and-forget)
+    if (req.fraudAlerts && req.fraudAlerts.length > 0) {
+        fraudAlertModel.updateMany(
+            { _id: { $in: req.fraudAlerts } },
+            { $set: { transaction: transaction._id } }
+        ).catch((err) =>
+            console.error("[TransactionController] Failed to link fraud alerts to transaction:", err)
+        );
+    }
+
     // Step 10: Send email notification (async, non-blocking)
 
-    await emailService.sendTransactionEmail(req.user.email, req.user.name, amount, toAccount)
+    emailService.sendTransactionEmail(req.user.email, req.user.name, amount, toAccount).catch((err) => {
+        console.error("[TransactionController] Failed to send transaction email:", err);
+    });
 
     return res.status(201).json({
         message: "Transaction completed successfully",

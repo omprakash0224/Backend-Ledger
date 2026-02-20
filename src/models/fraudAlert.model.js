@@ -55,6 +55,6 @@ const fraudAlertSchema = new mongoose.Schema(
 // Compound index for efficient lookups per account + rule over time
 fraudAlertSchema.index({ account: 1, ruleCode: 1, createdAt: -1 });
 
-const FraudAlert = mongoose.model("fraudAlert", fraudAlertSchema);
+const fraudAlertModel = mongoose.model("fraudAlert", fraudAlertSchema);
 
-module.exports = FraudAlert;
+module.exports = fraudAlertModel;

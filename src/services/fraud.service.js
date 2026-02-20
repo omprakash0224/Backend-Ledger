@@ -1,3 +1,4 @@
+const mongoose = require("mongoose");
 const transactionModel = require("../models/transaction.model");
 const ledgerModel = require("../models/ledger.model");
 
@@ -104,9 +105,7 @@ async function checkDailyLimit(fromAccountId, amount) {
       $match: {
         account: new mongoose.Types.ObjectId(fromAccountId),
         type: "DEBIT",
-        // Ledger has no timestamps by default — use transaction createdAt via $lookup
-        // Instead we filter by _id timestamp (ObjectId contains creation time)
-        _id: { $gte: objectIdFromDate(since) },
+        createdAt: { $gte: since },
       },
     },
     {
@@ -166,12 +165,7 @@ function checkNewAccountHighValue(fromAccountDoc, amount) {
 
 
 // ─── Helper: generate a MongoDB ObjectId from a date ─────────────────────────
-// Used in Rule 4 to filter ledger entries by creation time via ObjectId prefix
-function objectIdFromDate(date) {
-  const { Types } = require("mongoose");
-  const hexSeconds = Math.floor(date.getTime() / 1000).toString(16).padStart(8, "0");
-  return new Types.ObjectId(hexSeconds + "0000000000000000");
-}
+// No longer needed — ledger now has timestamps: true, createdAt is used directly
 // ─────────────────────────────────────────────────────────────────────────────
 
 
