@@ -1,0 +1,625 @@
+openapi: 3.0.3
+
+info:
+  title: Backend Ledger API
+  description: |
+    A double-entry ledger system with JWT authentication, account management,
+    atomic transactions, and real-time fraud detection.
+
+    ## Authentication
+    All protected routes require a **JWT token** passed via:
+    - `Authorization: Bearer <token>` header, **or**
+    - `token` cookie (set automatically on login/register)
+
+    ## Idempotency
+    The `POST /api/transactions` endpoint requires an **`idempotencyKey`** in the
+    request body. Use a unique UUID per transaction attempt. On retry, the same key
+    returns the existing transaction's status without creating a duplicate.
+
+    ## Fraud Detection
+    Transactions are screened by 5 rules before processing. Flagged transactions
+    are **never blocked** — they proceed and are logged as `fraudAlerts`.
+    An email alert is sent to the user asynchronously.
+
+    | Rule | Severity | Trigger |
+    |---|---|---|
+    | `VELOCITY` | MEDIUM | ≥5 transactions in 1 hour |
+    | `LARGE_AMOUNT` | HIGH | Single tx > ₹50,000 |
+    | `RAPID_SUCCESSIVE` | MEDIUM | Same sender→receiver within 5 min |
+    | `DAILY_LIMIT` | HIGH | Cumulative debit > ₹2,00,000 in 24h |
+    | `NEW_ACCOUNT_HIGH_VALUE` | HIGH | Account < 7 days old, tx > ₹10,000 |
+
+  version: 1.0.0
+  contact:
+    name: Backend Ledger Team
+
+servers:
+  - url: http://localhost:3000
+    description: Local Development
+  - url: https://your-production-url.com
+    description: Production
+
+# ─── SECURITY SCHEMES ─────────────────────────────────────────
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT token from login/register. Expires in 3 days.
+    CookieAuth:
+      type: apiKey
+      in: cookie
+      name: token
+      description: JWT token set automatically in cookie on login/register.
+
+  # ─── REUSABLE SCHEMAS ───────────────────────────────────────
+  schemas:
+
+    # ── User ──────────────────────────────────────────────────
+    UserPublic:
+      type: object
+      properties:
+        _id:
+          type: string
+          example: "64f1a2b3c4d5e6f7a8b9c0d1"
+        email:
+          type: string
+          format: email
+          example: "john@example.com"
+        name:
+          type: string
+          example: "John Doe"
+
+    # ── Account ───────────────────────────────────────────────
+    Account:
+      type: object
+      properties:
+        _id:
+          type: string
+          example: "64f1a2b3c4d5e6f7a8b9c0d2"
+        user:
+          type: string
+          description: ObjectId reference to the owner user
+          example: "64f1a2b3c4d5e6f7a8b9c0d1"
+        status:
+          type: string
+          enum: [ACTIVE, FROZEN, CLOSED]
+          default: ACTIVE
+          example: "ACTIVE"
+        currency:
+          type: string
+          default: INR
+          example: "INR"
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    # ── Transaction ───────────────────────────────────────────
+    Transaction:
+      type: object
+      properties:
+        _id:
+          type: string
+          example: "64f1a2b3c4d5e6f7a8b9c0d3"
+        fromAccount:
+          type: string
+          description: ObjectId of sender account
+          example: "64f1a2b3c4d5e6f7a8b9c0d2"
+        toAccount:
+          type: string
+          description: ObjectId of receiver account
+          example: "64f1a2b3c4d5e6f7a8b9c0d4"
+        amount:
+          type: number
+          minimum: 0
+          example: 5000
+        status:
+          type: string
+          enum: [PENDING, COMPLETED, FAILED, REVERSED]
+          example: "COMPLETED"
+        idempotencyKey:
+          type: string
+          description: Unique key to prevent duplicate processing
+          example: "txn-uuid-abc-123"
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    # ── Error ─────────────────────────────────────────────────
+    Error:
+      type: object
+      properties:
+        message:
+          type: string
+          example: "Unauthorized access, token is missing"
+
+    # ── Balance ───────────────────────────────────────────────
+    BalanceResponse:
+      type: object
+      properties:
+        accountId:
+          type: string
+          example: "64f1a2b3c4d5e6f7a8b9c0d2"
+        balance:
+          type: number
+          description: Derived from ledger (SUM CREDIT - SUM DEBIT). Not stored.
+          example: 25000
+
+  # ─── REUSABLE RESPONSES ─────────────────────────────────────
+  responses:
+    Unauthorized:
+      description: Missing or invalid JWT token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            missing:
+              value: { message: "Unauthorized access, token is missing" }
+            invalid:
+              value: { message: "Unauthorized access, token is invalid" }
+
+    Forbidden:
+      description: Valid token but insufficient permissions (not a system user)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            message: "Forbidden access, not a system user"
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            message: "Account not found"
+
+    ServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            message: "Transaction is Pending due to some issue, please retry after sometime"
+
+# ─── GLOBAL SECURITY (override per-route as needed) ───────────
+security:
+  - BearerAuth: []
+  - CookieAuth: []
+
+# ═══════════════════════════════════════════════════════════════
+#  PATHS
+# ═══════════════════════════════════════════════════════════════
+paths:
+
+  # ─────────────────────────────────────────────────────────────
+  #  AUTH ROUTES  /api/auth
+  # ─────────────────────────────────────────────────────────────
+
+  /api/auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a new user
+      description: |
+        Creates a new user account. On success:
+        - Returns user object + JWT token
+        - Sets `token` cookie (3-day expiry)
+        - Sends a welcome email asynchronously (non-blocking)
+      security: []   # Public route
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password, name]
+              properties:
+                email:
+                  type: string
+                  format: email
+                  example: "john@example.com"
+                password:
+                  type: string
+                  minLength: 6
+                  example: "securepassword123"
+                name:
+                  type: string
+                  example: "John Doe"
+      responses:
+        '201':
+          description: User registered successfully
+          headers:
+            Set-Cookie:
+              description: JWT token cookie (token=<jwt>; HttpOnly)
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    $ref: '#/components/schemas/UserPublic'
+                  token:
+                    type: string
+                    example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+        '422':
+          description: Email already registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                message: "User already exists with this email"
+                status: "failed"
+
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      summary: Login with email and password
+      description: |
+        Authenticates a user and returns a JWT token.
+        - Sets `token` cookie (3-day expiry)
+        - Token can also be used via `Authorization: Bearer` header
+      security: []   # Public route
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                  example: "john@example.com"
+                password:
+                  type: string
+                  example: "securepassword123"
+      responses:
+        '200':
+          description: Login successful
+          headers:
+            Set-Cookie:
+              description: JWT token cookie
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    $ref: '#/components/schemas/UserPublic'
+                  token:
+                    type: string
+                    example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+        '401':
+          description: Invalid email or password
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                message: "Email or password is INVALID"
+
+  /api/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Logout current user
+      description: |
+        Invalidates the JWT token by adding it to a blacklist collection.
+        - Clears the `token` cookie
+        - Blacklisted token auto-expires after 3 days (TTL index)
+        - Works even if no token is present (returns 200 either way)
+      security:
+        - BearerAuth: []
+        - CookieAuth: []
+      responses:
+        '200':
+          description: Logged out successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "User logged out successfully"
+
+  # ─────────────────────────────────────────────────────────────
+  #  ACCOUNT ROUTES  /api/accounts
+  # ─────────────────────────────────────────────────────────────
+
+  /api/accounts:
+    post:
+      tags: [Accounts]
+      summary: Create a new account
+      description: |
+        Creates a new bank account for the authenticated user.
+        - Default currency: `INR`
+        - Default status: `ACTIVE`
+        - Balance starts at ₹0 (ledger-derived, not stored)
+      security:
+        - BearerAuth: []
+        - CookieAuth: []
+      responses:
+        '201':
+          description: Account created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  account:
+                    $ref: '#/components/schemas/Account'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    get:
+      tags: [Accounts]
+      summary: Get all accounts for current user
+      description: Returns all accounts owned by the authenticated user.
+      security:
+        - BearerAuth: []
+        - CookieAuth: []
+      responses:
+        '200':
+          description: List of accounts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accounts:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Account'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/accounts/balance/{accountId}:
+    get:
+      tags: [Accounts]
+      summary: Get account balance
+      description: |
+        Returns the current balance of an account.
+
+        **Balance is NOT stored** — it's computed on every call via MongoDB aggregation:
+        ```
+        balance = SUM(CREDIT ledger entries) - SUM(DEBIT ledger entries)
+        ```
+        Only the account owner can fetch their own balance.
+      security:
+        - BearerAuth: []
+        - CookieAuth: []
+      parameters:
+        - name: accountId
+          in: path
+          required: true
+          description: MongoDB ObjectId of the account
+          schema:
+            type: string
+            example: "64f1a2b3c4d5e6f7a8b9c0d2"
+      responses:
+        '200':
+          description: Balance fetched successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BalanceResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ─────────────────────────────────────────────────────────────
+  #  TRANSACTION ROUTES  /api/transactions
+  # ─────────────────────────────────────────────────────────────
+
+  /api/transactions:
+    post:
+      tags: [Transactions]
+      summary: Create a new transaction (transfer funds)
+      description: |
+        Transfers funds between two accounts using a **10-step atomic flow**:
+
+        1. Validate request fields
+        2. Check idempotency key (prevent duplicates)
+        3. Verify both accounts are `ACTIVE`
+        4. Check sender has sufficient balance (ledger-derived)
+        5. Create transaction record (`PENDING`)
+        6. Create `DEBIT` ledger entry for sender
+        7. Create `CREDIT` ledger entry for receiver
+        8. Mark transaction `COMPLETED`
+        9. Commit MongoDB session (atomic)
+        10. Send confirmation email (async, non-blocking)
+
+        **Fraud detection** runs as middleware before the controller:
+        - Checks 5 rules in parallel
+        - Saves `fraudAlerts` if triggered
+        - Sends fraud alert email asynchronously
+        - **Never blocks the transaction**
+
+        ### Idempotency Behaviour
+        | Existing Status | HTTP Response |
+        |---|---|
+        | `COMPLETED` | `200` — returns existing transaction |
+        | `PENDING` | `200` — informs still processing |
+        | `FAILED` | `500` — instructs to retry |
+        | `REVERSED` | `500` — instructs to retry |
+      security:
+        - BearerAuth: []
+        - CookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fromAccount, toAccount, amount, idempotencyKey]
+              properties:
+                fromAccount:
+                  type: string
+                  description: ObjectId of sender's account
+                  example: "64f1a2b3c4d5e6f7a8b9c0d2"
+                toAccount:
+                  type: string
+                  description: ObjectId of receiver's account
+                  example: "64f1a2b3c4d5e6f7a8b9c0d4"
+                amount:
+                  type: number
+                  minimum: 0
+                  description: Amount to transfer in INR
+                  example: 5000
+                idempotencyKey:
+                  type: string
+                  description: Unique UUID to prevent duplicate transactions on retry
+                  example: "550e8400-e29b-41d4-a716-446655440000"
+            examples:
+              standard_transfer:
+                summary: Standard transfer
+                value:
+                  fromAccount: "64f1a2b3c4d5e6f7a8b9c0d2"
+                  toAccount: "64f1a2b3c4d5e6f7a8b9c0d4"
+                  amount: 5000
+                  idempotencyKey: "550e8400-e29b-41d4-a716-446655440000"
+              large_transfer:
+                summary: Large transfer (will trigger LARGE_AMOUNT fraud rule)
+                value:
+                  fromAccount: "64f1a2b3c4d5e6f7a8b9c0d2"
+                  toAccount: "64f1a2b3c4d5e6f7a8b9c0d4"
+                  amount: 75000
+                  idempotencyKey: "550e8400-e29b-41d4-a716-446655440001"
+      responses:
+        '201':
+          description: Transaction completed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "Transaction completed successfully"
+                  transaction:
+                    $ref: '#/components/schemas/Transaction'
+        '200':
+          description: Idempotent response — transaction already exists
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "Transaction already completed"
+                  transaction:
+                    $ref: '#/components/schemas/Transaction'
+        '400':
+          description: Validation error — missing fields, invalid accounts, frozen account, or insufficient balance
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                missing_fields:
+                  value: { message: "FromAccount, toAccount, amount and idempotencyKey are required" }
+                invalid_accounts:
+                  value: { message: "Invalid fromAccount or toAccount" }
+                frozen_account:
+                  value: { message: "Both fromAccount and toAccount must be ACTIVE to process transaction" }
+                insufficient_balance:
+                  value: { message: "Insufficient balance. Current balance is 1000. Requested amount is 5000" }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/transactions/system/initial-funds:
+    post:
+      tags: [Transactions, System]
+      summary: Seed initial funds into an account (System only)
+      description: |
+        **⚠️ System users only.** Used for testing/seeding purposes.
+
+        Transfers funds from the system user's account to any target account.
+        Bypasses fraud detection middleware.
+
+        Requires `systemUser: true` on the authenticated user's profile.
+        This flag is immutable and hidden from regular API responses.
+      security:
+        - BearerAuth: []
+        - CookieAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [toAccount, amount, idempotencyKey]
+              properties:
+                toAccount:
+                  type: string
+                  description: Target account to receive funds
+                  example: "64f1a2b3c4d5e6f7a8b9c0d4"
+                amount:
+                  type: number
+                  minimum: 0
+                  example: 100000
+                idempotencyKey:
+                  type: string
+                  example: "seed-uuid-abc-123"
+      responses:
+        '201':
+          description: Initial funds added successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "Initial funds transaction completed successfully"
+                  transaction:
+                    $ref: '#/components/schemas/Transaction'
+        '400':
+          description: Missing fields or invalid account
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              examples:
+                missing_fields:
+                  value: { message: "toAccount, amount and idempotencyKey are required" }
+                invalid_account:
+                  value: { message: "Invalid toAccount" }
+                no_system_account:
+                  value: { message: "System user account not found" }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+# ─── TAGS ──────────────────────────────────────────────────────
+tags:
+  - name: Auth
+    description: Register, login, and logout
+  - name: Accounts
+    description: Create and manage user bank accounts
+  - name: Transactions
+    description: Transfer funds between accounts (atomic, idempotent, fraud-screened)
+  - name: System
+    description: System-level operations restricted to system users
